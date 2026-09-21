@@ -1,0 +1,116 @@
+name: Build AN758x U-Boot
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'      # 只有以 v 开头的 Tag（如 v1.0.0）才触发 Release 流程
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: '是否发布 Release'
+        required: true
+        type: boolean
+        default: false
+      release_tag:
+        description: '自定义 Release Tag（仅手动触发且勾选发布时生效，留空默认使用日期）'
+        required: false
+        type: string
+        default: ''
+
+# 移除顶层统一 permissions，改为在 Job 层面精确授权，遵循最小权限原则
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - hg5382a
+          - hg5585f-ct
+          - hg5585f-cu
+          - xg2010g
+          - zn504xg-d
+          - zn515xg-d
+          - ung00a
+          - xg-040g-md
+          - xg-040g-tf
+          - xg-040g-mf
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison ca-certificates curl device-tree-compiler flex \
+            gcc-aarch64-linux-gnu gcc-arm-none-eabi libssl-dev \
+            python3 python3-pyelftools swig
+
+      - name: Download Mbed TLS
+        run: |
+          curl -L https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/v3.4.1.tar.gz |
+            tar -xz
+          echo "MBEDTLS_DIR=$PWD/mbedtls-3.4.1" >> "$GITHUB_ENV"
+
+      - name: Build ${{ matrix.target }}
+        env:
+          CROSS_COMPILE: aarch64-linux-gnu-
+          ARM32_CROSS_COMPILE: arm-none-eabi-
+          BUILD_JOBS: 4
+          AIROHA_SIGN_KEY: ${{ secrets.AIROHA_SIGN_KEY }}
+        run: ./scripts/build-an758x.sh "${{ matrix.target }}"
+
+      - name: Upload ${{ matrix.target }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: an758x-${{ matrix.target }}
+          path: output/${{ matrix.target }}/an75*
+          if-no-files-found: error
+
+  release:
+    # 规范的触发条件判断：
+    # 1. 只有当推送了 Tag（refs/tags/）时触发
+    # 2. 或者在网页手动点击（workflow_dispatch）且勾选了 create_release 时触发
+    if: >-
+      startsWith(github.ref, 'refs/tags/') || 
+      (github.event_name == 'workflow_dispatch' && inputs.create_release == true)
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # 发布 Release 仅需向此 Job 授予写入权限
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: an758x-*
+          path: release
+          merge-multiple: true
+
+      - name: Determine Release Tag
+        id: tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            # 自动推送 Tag 触发
+            TAG_NAME="${GITHUB_REF_NAME}"
+          elif [ -n "${{ inputs.release_tag }}" ]; then
+            # 手动触发且填写了自定义 Tag
+            TAG_NAME="${{ inputs.release_tag }}"
+          else
+            # 手动触发未填写 Tag，自动按日期生成带时间戳的 Tag
+            TAG_NAME="nightly-$(date +'%Y%m%d-%H%M%S')"
+          fi
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${{ steps.tag.outputs.tag_name }}" release/*
+          --generate-notes
+          --repo "$GITHUB_REPOSITORY"
